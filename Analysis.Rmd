@@ -1,0 +1,233 @@
+---
+title: "UCSF - Annotation"
+author: "Meenakshi_Somadasan"
+date: "2024-11-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+### Load the required packages
+```{r load, warning=FALSE, message=FALSE}
+library(Seurat)
+library(SingleR)
+library(celldex)
+library(SeuratDisk)
+library(clustree)
+```
+
+### Load the dataset
+
+PS: The hdf5 file was loaded on scanpy and the files were saved in this format for ease of use. (code attached in the email)
+```{r data, fig.width=10, fig.height=12}
+matrix_path <- "./seurat_conversion/counts.mtx"
+features_path <- "./seurat_conversion/features.tsv"
+barcodes_path <- "./seurat_conversion/barcodes.tsv"
+
+# Read in the matrix, features, and barcodes as a Seurat object
+obj <- CreateSeuratObject(counts = ReadMtx(mtx = matrix_path,features = features_path, cells = barcodes_path, feature.column = 1  ), meta.data = read.csv("metadata.csv", row.names = 1))
+obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^MT-")
+FeatureScatter(obj, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+```
+
+### Pre-processing
+```{r pre}
+#Pre-process 
+obj <- NormalizeData(obj)
+obj <- FindVariableFeatures(obj)
+obj <- ScaleData(obj)
+```
+
+
+### Dimensionality reduction
+```{r pca, fig.width=10, fig.height=12}
+#PCA
+obj <- RunPCA(obj, features = VariableFeatures(object = obj))
+ElbowPlot(obj) #Knee at 20 PC
+```
+
+```{r plot-pca, fig.width=10, fig.height=12}
+DimHeatmap(obj, dims = 1:10, cells = 500, balanced = TRUE) #Suggests likely existence of batch effect - look for biological reasons for variations
+Idents(obj) <- "platform"
+DimPlot(obj, reduction = "pca")
+```
+### Clustering of un-integrated object
+```{r cluster}
+#Clustering
+obj <- FindNeighbors(obj, dims = 1:20)
+obj <- FindClusters(obj, resolution = c(0.2, 0.3, 0.4, 0.5, 0.7, 0.8))
+```
+
+#### Validate the clustering 
+```{r cluster-stability, fig.width=10, fig.height=16}
+clustree::clustree(obj, prefix = "RNA_snn_res.")
+Idents(obj) <- "RNA_snn_res.0.4" #least crossover
+```
+
+### Non-linear dimensionality reduction
+```{r umap}
+#UMAP
+obj <- RunUMAP(obj, dims = 1:20)
+```
+
+```{r plot-umap, fig.width=10, fig.height=12}
+DimPlot(obj, reduction = "umap", label = TRUE)
+DimPlot(obj, reduction = "umap", group.by = "developmental_stage", label = TRUE) #Likely cause for batch effect due to biological differences
+DimPlot(obj, reduction = "umap", group.by = "site", label = TRUE) #Likely cause for batch effect due to biological differences
+DimPlot(obj, reduction = "umap", group.by = "platform", label = TRUE) #Some technical variation exists
+```
+
+As seen in the above UMAP plots, the batch effect can exist dueto the different stages in developement or can be of technical origin. Correcting for batch effects wrt technical variable - platforms. 
+
+### Batch Effect Correction wrt Platform
+```{r batch}
+#Batch effect corrections wrt platform
+obj.list <- SplitObject(obj, split.by = "platform")
+obj.list <- lapply(X = obj.list, FUN = function(x) {
+  x <- NormalizeData(x)
+  x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 5000)
+})
+```
+
+```{r batch-combine}
+features <- SelectIntegrationFeatures(object.list = obj.list)
+anchors <- FindIntegrationAnchors(object.list = obj.list, anchor.features = features)
+combined <- IntegrateData(anchorset = anchors)
+DefaultAssay(combined) <- "integrated"
+```
+
+```{r comb-pre}
+combined <- ScaleData(combined, verbose = FALSE)
+combined <- RunPCA(combined, npcs = 30, verbose = FALSE)
+combined <- RunUMAP(combined, reduction = "pca", dims = 1:30)
+combined <- FindNeighbors(combined, reduction = "pca", dims = 1:30)
+combined <- FindClusters(combined, resolution = c(0.2, 0.3, 0.4, 0.5, 0.7, 0.8))
+
+```
+
+```{r comb-plot-umap, fig.width=10, fig.height=16}
+clustree::clustree(combined, prefix = "integrated_snn_res.")
+```
+
+```{r comb-plot-umap, fig.width=10, fig.height=12}
+DimPlot(combined, reduction = "umap", label = TRUE, repel = TRUE)
+DimPlot(combined, reduction = "umap", group.by = "platform")
+DimPlot(combined, reduction = "umap", group.by = "developmental_stage")
+DimPlot(combined, reduction = "umap", group.by = "site", label = TRUE)
+```
+
+#### Check for any clusters with high levels of mitochondrial gene expression
+```{r mt-plot-clusters}
+FeaturePlot(combined, features = "percent.mt") 
+```
+
+Cluster 7 shows presence of a few cells where mitochondrial genes are expressed. 
+
+
+
+### Annotation
+The clusters were annotated on the basis of the presence of markers derived from these papers as well as on the basis of cluster markers found using FindAllMarkers() and EnrichR. Avoiding automatic annotation as the dataset requires a reference with embryonic cells for better accuracy. 
+
+References: 
+1. https://pmc.ncbi.nlm.nih.gov/articles/PMC7780123/
+2. https://www.cell.com/cell/fulltext/S0092-8674(22)01415-5
+
+
+```{r gene-marker}
+#Annotation - Marker genes
+#PS: Refer to papers 1&2 for gene markers in embryonic cells create list from dot plots 
+DefaultAssay(combined) <- "RNA"
+gene_lists <- list(
+  Progenitors = c("CD34", "CD74", "MPO", "PLXNC1", "DEPTO", "SOS1", "TTC27", "PPBP", "LGALS1", "KIT", "LMO4", "CPA3","SLC16A9", "FAM177B", "KIF18B", "KIF15","TMCC2", "HBB"),
+  Overall = c("SALL1", "HTRA1", "LILRB5", "CD209", "S100A9", "S100A8", "CD1C", "CLEC10A", "CCSER1", "NEGR1", "CCDC50", "AC023590.1", "BIRC3", "KDM2B", "FAM46C", "XBP1", "VPREB3", "PAX5", "SORCS1", "JMY", "KLRD1", "GNLY", "TENM1", "CD5", "RHCE", "SLC25A21", "CPA3", "IL1RL1", "TMEM40", "PF4", "DEPTO", "PDZD8", "MPO", "PRTN3"),
+  Myeloid = c("ORM1", "FCGR3B", "MPO", "RNASE2", "MKI67", "CD14", "S100A12", "RBP7", "CX3CR1", "METTL7", "CLQA", "TREM2", "APOE", 
+            "SPP1", "LYVE1", "CD1C", "FCER1A", "CLEC10A", "FCGBP", "CES1", "MTMR11", "FCGR3A", "CD300E", "CCR7", "CCL19", 
+            "LAMP3", "MMP9", "GCH1", "GBP2", "TRAF1", "CCL22", "GZMB", "JCHAIN", "CLEC9A", "XCR1", "SIGLEC6", "SPINK2", 
+            "CD34", "NPR3", "TESPA1", "IGHM", "PRSS2", "ELANE", "DEFA4", "S100A8", "FCN1", "TPSB2", "GATA2", "MYH10", 
+            "GATA1", "CLC", "IL5RA", "CCR3", "IL3RA", "ZNF302", "LCN2", "CAMP", "PF4", "MYL9", "CLCN7", "HIST1H4H"),
+  Lymphoid = c("PTPRC", "CCR9", "RAG1", "PTGDR2", "HPGDS", "CCR6", "KIT", "CA2", "SCN1B", "NCAM1", "HPN", "GZMK", "TNFRSF9", 
+            "RAMP1", "GZMB", "FCRL6", "MKI67", "FOXP3", "CD4", "CD40LG", "CD8A", "KLRC2", "ZNF683", "IFNG-AS1", "SLC4A10", 
+            "CXCR6", "KLRB1", "IL4I1", "NPDC1"),
+  Erythroid_Endothelial = c("GDF15", "HMOX1", "HBE1", "GYPA", "HBB", "KLF1", "GATA1", "MKI67", "CPEB4", "XPO7", "UCP2", "PROX1", "STAB2", 
+            "AKR1C2", "RNASE4", "SCG3", "OMAD", "SSUH2", "DKK2", "GRIA2", "GJA5", "APOL4", "CA4", "S100A3", "ACKR1", 
+            "HDAC9", "PLVAP", "THY1", "CD24", "KIT", "IL7R", "EGLN1"),
+  PNS = c("FGFBP2", "MFNG", "KCNIP4", "TM4SF4", "CHODL", "NXPH4", "DPY5", "DPY4", "PCP4", "SV2C", "PENK", "TMEM176B", 
+            "CXCL12", "GPNMB", "MICALL2", "APOA1", "MBP", "TYMS", "COL20A1", "ITM2A", "ALDH1A1", "OLFML2A", "HNRNPA1P48", 
+            "CYR61"),
+  B_Lymphoid = c("CD9", "CD27", "CD334", "DNTT", "IL7R", "TYMS", "IGLL5", "TCL1A", "LTB", "LINC01013", "TNFRSF17", "AL133467.1", 
+            "CDHR3", "IGF2.1", "CEBPD", "CCL22", "CCR10", "CD5", "IGHD", "JCHAIN", "BCL7A", "HHEX", "CD38", "VPREB1", "CCND3")
+)
+```
+
+```{r plot-T, fig.width=15, fig.height=17}
+
+DotPlot(combined, assay= 'RNA',features = c("CD4","CCR7", "LEF1", "TCF7", "AQP3", "CD69", "CCR6", "CXCR6", "CCL5", "PRDM1", "FOXP3", "CD8A","GZMK", "GZMB", "GNLY", "PRF1"))
+
+```
+
+Cluster 3 has Cytotoxic T cells, 18 has NAive CD4+ T cells, 6 may be central memory T cells and 31 has NK cells. 
+
+```{r plot-prog, fig.width=15, fig.height=17}
+#Plot for identifying Progenitor clusters
+DotPlot(combined, features = gene_lists$Progenitors, dot.scale = 8) + RotatedAxis()
+```
+
+Cluster 20 and 8 are Endothelium Progenitors (likely vascular). 19 has Basophil Mast cells. 
+
+```{r plot-overall, fig.width=15, fig.height=17}
+#Plot for identifying PNS clusters
+DotPlot(combined, features = gene_lists$Overall, dot.scale = 8) + RotatedAxis()
+```
+
+```{r plot-pns, fig.width=15, fig.height=17}
+#Plot for identifying PNS clusters
+DotPlot(combined, features = gene_lists$PNS, dot.scale = 8) + RotatedAxis()
+```
+
+```{r plot-lym, fig.width=15, fig.height=17}
+#Plot for identifying Lymphoid cells
+DotPlot(combined, features = gene_lists$Lymphoid, dot.scale = 8) + RotatedAxis()
+```
+
+Immune cell clusters are likely 3, 5, 6, 11, 12, 18, 22, 31, 35. 
+Cluster 6 likely has ILC3 cells.
+
+```{r plot-my, fig.width=15, fig.height=17}
+#Plot for identifying Myeloid cells
+DotPlot(combined, features = gene_lists$Myeloid, dot.scale = 8) + RotatedAxis()
+```
+ 
+
+```{r plot-b, fig.width=15, fig.height=17}
+#Plot for identifying B cells
+DotPlot(combined, features = gene_lists$B_Lymphoid, dot.scale = 8) + RotatedAxis()
+```
+
+```{r plot-ery, fig.width=15, fig.height=17}
+#Plot for identifying Erythroid and Endothelial
+DotPlot(combined, features = gene_lists$Erythroid_Endothelial, dot.scale = 8) + RotatedAxis()
+```
+
+From this plot we can confidently annotate clusters 33 (Primitive Erythrocyte), 14(Definitive Reticulocyte),and  15 (Lymphatic Endothelium) while cluster 20 (Arterial Endothelium) can be annotated with a lower confidence level as the markers are not as highly expressed. Cluster 8 has cells that are a part of Vascular Endothelium.36 is likely Venous Endothelium but the confidence for this annotation is very low as it does not merge close to clusters 20 and 8, and also expresses neural progenitor marker FGFBP2 while not merging with 9 or 0.
+
+
+All remaining clusters were annotated on the basis of markers, by surveying EnrichR using the top 10 positively enriched marker genes for the clusters. The file has been attached in the email. 
+
+
+### Cell Assignment
+
+```{r assign, fig.width=15, fig.height=17}
+Idents(combined) <- combined$integrated_snn_res.0.8
+new.cluster.ids <- c("PCP4+ Neuron", "DCLK1+ Progenitors", "Clara Progenitors", "Cytotoxic T", "B", "CD1C+ DC", "Central Memory T", "Unknown", "Vascular Endothelium", "Schwann Precursor", "Neural Progenitors", "S100A12+ Classical Monocytes", "B", "Neuronal Progenitors" ,"Definitive Reticulocyte", "Lymphatic Endothelium", "Microglia", "Unknown", "Naive CD4+", "Basophil Mast", "Arterial Endothelium", "Unknown", "DC", "Promylocyte-like", "Epithelium", "Clara Progenitors", "Neuroendocrine", "Neuronal Progenitors", "Megakaryocyte", "DCLK1+ Progenitors", "Neural Progenitors", "NK", "BMEC", "Primitive Erythrocyte","Epithelium", "pDC" ,"Venous Endothelium")
+names(new.cluster.ids) <- levels(combined)
+combined <- RenameIdents(combined, new.cluster.ids)
+DimPlot(combined, reduction = "umap", label = TRUE, pt.size = 0.5) 
+```
+
+```{r sess}
+sessionInfo()
+```
+
+
+
